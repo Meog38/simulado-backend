@@ -1,17 +1,35 @@
-# API de avaliações
+# Backend — API de Avaliações
 
-Backend REST em Java 21, Spring Boot, PostgreSQL e Auth0. O front-end não faz parte deste repositório.
+API REST de exemplo para cadastro e consulta de avaliações. O projeto usa Java 21,
+Spring Boot, Spring Security Resource Server, Auth0, PostgreSQL, Flyway e Maven.
 
-## Endpoints
+Este README descreve o estado atual do repositório, como executá-lo e como
+substituir o modelo de autenticação/autorização quando a API passar a atender
+outro domínio de negócio. O frontend está no repositório
+[`simulado-frontend`](../simulado-frontend/README.md).
 
-Todas as rotas exigem um access token JWT válido do Auth0, com issuer e audience correspondentes à configuração da API.
+> **Atenção — configuração temporária de demonstração:** a EC2 deste exercício
+> foi alterada para escutar em `0.0.0.0:8080`, e a porta TCP 8080 está acessível
+> publicamente para permitir que a rewrite da Vercel chegue à API. O tráfego da
+> Vercel até a EC2 usa HTTP, não HTTPS. Tokens e dados atravessam esse trecho sem
+> criptografia. Não use esta configuração para dados reais. O serviço originalmente
+> foi instalado para escutar em `127.0.0.1`; consulte [Exposição temporária da
+> EC2](#exposição-temporária-da-ec2-e-como-reverter) para restaurar esse estado.
 
-| Método | Rota | Acesso |
+## 1. O que a API faz hoje
+
+| Método | Caminho | Regra de acesso |
 |---|---|---|
-| `POST` | `/avaliacoes` | Role `ADMIN` |
-| `GET` | `/avaliacoes` | Role `ADMIN` ou `USER` |
+| `GET` | `/avaliacoes` | Token válido com role `USER` ou `ADMIN`; também aceita a permissão `avaliacoes:read`. |
+| `POST` | `/avaliacoes` | Token válido com role `ADMIN`; também aceita a permissão `avaliacoes:write`. |
+| `OPTIONS` | `/avaliacoes` | Preflight CORS para métodos e cabeçalhos configurados. |
 
-O `POST` recebe:
+Todas as outras combinações de método e caminho são negadas. Não há endpoint
+público de health check neste momento.
+
+### Criar avaliação
+
+`POST /avaliacoes` recebe:
 
 ```json
 {
@@ -21,13 +39,115 @@ O `POST` recebe:
 }
 ```
 
-O e-mail do avaliador não é aceito no corpo: é obtido da claim `email` do token autenticado. O servidor gera `id` e `dataAvaliacao`. A nota aceita valores de `0` a `10`, com até uma casa decimal.
+Regras de validação atuais:
 
-## Auth0
+- `emailAvaliado`: obrigatório, formato de e-mail e no máximo 320 caracteres.
+- `comentariosAvaliacao`: obrigatório, no máximo 5.000 caracteres.
+- `nota`: obrigatória, de 0 a 10, com no máximo uma casa decimal.
+- `emailAvaliador`: não é aceito no corpo; é retirado da claim configurada no
+  access token.
+- `id` e `dataAvaliacao`: gerados pelo servidor.
+- Resposta de criação: HTTP `201` com a avaliação criada.
 
-1. No Auth0 Dashboard, abra **Applications > APIs > Create API**. Defina um nome e um **Identifier** (esse valor será `AUTH0_AUDIENCE`) e escolha RS256.
-2. Em **User Management > Roles**, crie as roles `ADMIN` e `USER` e atribua-as aos usuários.
-3. Crie uma **Post Login Action** em **Actions > Library** e adicione ao flow de login. Exemplo para emitir roles e e-mail no access token:
+### Consultar avaliações
+
+`GET /avaliacoes` retorna a lista de avaliações. A resposta contém `id`,
+`emailAvaliador`, `emailAvaliado`, `comentariosAvaliacao`, `nota` e
+`dataAvaliacao`.
+
+### Códigos de resposta comuns
+
+- `200`: consulta concluída.
+- `201`: registro criado.
+- `400`: corpo inválido ou campos não passaram na validação.
+- `401`: token ausente, inválido, expirado, issuer incorreto ou audience ausente.
+- `403`: token válido, mas sem a role/permissão necessária; ou sem a claim de
+  e-mail necessária ao criar uma avaliação.
+- `5xx`: falha do servidor, banco de dados ou dependência.
+
+## 2. Componentes e configuração
+
+| Caminho | Responsabilidade |
+|---|---|
+| `src/main/java/br/com/simulado/avaliacoes/avaliacao/` | Controller, serviço, entidade, DTOs e regras de validação do domínio de avaliações. |
+| `src/main/java/br/com/simulado/avaliacoes/config/SecurityConfig.java` | Regras HTTP, validação do JWT, conversão de roles/permissões e CORS. |
+| `src/main/java/br/com/simulado/avaliacoes/config/AudienceValidator.java` | Confere se o access token contém a audience da API. |
+| `src/main/java/br/com/simulado/avaliacoes/config/Auth0RolesConverter.java` | Traduz claims de roles e permissions do JWT em authorities Spring. |
+| `src/main/resources/application.yml` | Configuração Spring e nomes das variáveis de ambiente. |
+| `src/main/resources/db/migration/` | Migrações versionadas do banco, aplicadas pelo Flyway. |
+| `src/test/` | Testes unitários e de integração. |
+| `docker-compose.yml` | PostgreSQL para desenvolvimento local. |
+| `.github/workflows/deploy.yml` | Build/teste e deploy SSH para a EC2 quando há push em `main`. |
+| `.env.example` | Exemplo de configuração local; não contém credenciais válidas de produção. |
+
+Versões principais declaradas em `pom.xml`: Spring Boot 3.4.4 e Java 21.
+
+## 3. Como o Auth0 participa de uma chamada
+
+O backend é um **resource server**: não recebe senha, não inicia login e não cria
+sessão de navegador. O frontend direciona o usuário ao Auth0, recebe um access
+token e envia `Authorization: Bearer <access-token>` à API. O backend valida a
+assinatura e as claims do token antes de executar a rota.
+
+Fluxo resumido:
+
+1. A SPA autentica o usuário no tenant Auth0.
+2. A SPA solicita um access token para a API indicada por `AUTH0_AUDIENCE`.
+3. Uma Post Login Action acrescenta as claims customizadas de roles e e-mail.
+4. A SPA envia o access token à API.
+5. Spring Security valida assinatura, issuer e audience.
+6. `Auth0RolesConverter` converte roles/permissões para authorities Spring.
+7. As regras da rota autorizam ou negam a operação.
+
+Não confunda:
+
+- **Domain/Issuer:** identifica o tenant que emitiu o token. `AUTH0_ISSUER_URI`
+  deve corresponder exatamente ao issuer (`iss`) do token, normalmente com
+  `https://` e `/` final.
+- **Client ID:** identifica uma aplicação cliente Auth0, como a SPA. Não é a
+  audience e não é segredo quando usado por uma SPA.
+- **Audience / API Identifier:** identifica o resource server. Precisa coincidir
+  com `AUTH0_AUDIENCE` no backend e `VITE_AUTH0_AUDIENCE` no frontend.
+- **Role:** papel atribuído ao usuário no Auth0, como `ADMIN`. O backend ainda
+  precisa mapear e exigir esse valor; criar a role no Dashboard, sozinho, não
+  muda as regras do código.
+- **Claim:** propriedade dentro do JWT. Os nomes de claims customizadas precisam
+  coincidir exatamente entre Action, configuração do backend e leitura no front.
+
+### Configuração atual do tenant
+
+Valores específicos deste exercício, que devem ser substituídos ao criar outra
+aplicação:
+
+| Item | Valor atual |
+|---|---|
+| Tenant domain | `dev-cfz5e0arc3y56xsi.us.auth0.com` |
+| Issuer | `https://dev-cfz5e0arc3y56xsi.us.auth0.com/` |
+| API Identifier / audience | `https://simulado-backend` |
+| Claim de roles | `https://simulado-backend.example.com/roles` |
+| Claim de e-mail | `https://simulado-backend.example.com/email` |
+| Roles de domínio reconhecidas | `ADMIN`, `USER` |
+| Permissions reconhecidas | `avaliacoes:read`, `avaliacoes:write` |
+
+O Identifier `https://simulado-backend` é um identificador lógico; não precisa
+ser uma URL que abre um site. Mantenha-o igual em todos os participantes do fluxo.
+
+### Preparar Auth0 para este backend
+
+1. Em **Applications > APIs**, crie ou selecione uma API. Configure um Identifier
+   (audience) único, por exemplo `https://simulado-backend`, e use RS256.
+2. Em **Applications > Applications**, crie ou selecione uma aplicação do tipo
+   **Single Page Application** para o frontend.
+3. Na API, abra **Application Access** e permita acesso delegado à SPA. Neste
+   tenant o controle é **Per-app authorization**; a SPA deste exercício foi
+   autorizada individualmente. Ao trocar de SPA, conceda acesso à nova aplicação
+   à API. Não autorize aplicações que não precisam dela.
+4. Em **User Management > Roles**, crie as roles que o sistema realmente usa e
+   atribua-as a usuários. Atualmente `ADMIN` e `USER` são os papéis aceitos.
+5. Em **Actions > Library**, crie/edite uma Action do trigger **Login / Post
+   Login** e conecte-a ao flow **Actions > Flows > Login** (o nome exato do menu
+   pode variar com a interface do Dashboard).
+6. Use o namespace configurado no backend. Exemplo atual:
 
    ```javascript
    exports.onExecutePostLogin = async (event, api) => {
@@ -41,164 +161,314 @@ O e-mail do avaliador não é aceito no corpo: é obtido da claim `email` do tok
    };
    ```
 
-4. No ambiente da aplicação, configure:
-   - `AUTH0_ISSUER_URI`: domínio do tenant exibido nas configurações do Auth0 (por exemplo, `https://seu-tenant.us.auth0.com/`) com a barra final.
-   - `AUTH0_AUDIENCE`: o **Identifier** da API criada no passo 1.
-   - `AUTH0_ROLES_CLAIM`: `https://simulado-backend.example.com/roles` se usar o exemplo acima.
-   - `AUTH0_EMAIL_CLAIM`: `https://simulado-backend.example.com/email` se usar o exemplo acima.
+7. Faça **Deploy** da Action e confira que ela está posicionada no fluxo de login,
+   antes de **Complete**. Uma Action apenas criada ou implantada, mas não
+   conectada ao flow, não altera os tokens.
+8. Configure callback, logout e web origins da SPA com as origens reais:
+   `http://localhost:5173` para Vite local e `https://simulado-frontend-seven.vercel.app`
+   para produção. Para URLs de callback/origin, não acrescente caminhos; use a
+   origem exata.
+9. Faça login e inspecione o **access token** emitido para a API. Verifique `iss`,
+   `aud`, a claim de roles e, se necessário, a claim de e-mail. Não publique o
+   token em screenshots, logs ou tickets.
 
-A API também reconhece as permissões `avaliacoes:read` e `avaliacoes:write` no claim `permissions`, mapeadas para `USER` e `ADMIN`, respectivamente. Caso use permissões em vez de roles, habilite RBAC e **Add Permissions in the Access Token** nas configurações da API do Auth0. Se trocar o namespace do exemplo, atualize as claims de roles e e-mail no Action e configure `AUTH0_ROLES_CLAIM` e `AUTH0_EMAIL_CLAIM` com os nomes exatos.
+#### Roles ou permissions
 
-## Executar localmente
+Este backend aceita os dois formatos:
 
-Requisitos: JDK 21, Maven 3.9+ e Docker Compose.
+- **Roles:** a Action emite a lista na claim `AUTH0_ROLES_CLAIM`; valores `ADMIN`
+  e `USER` são mapeados a `ROLE_ADMIN` e `ROLE_USER`. A configuração de roles
+  precisa ser enviada ao access token, não apenas ao ID token.
+- **Permissions:** o backend reconhece `avaliacoes:read` como `ROLE_USER` e
+  `avaliacoes:write` como `ROLE_ADMIN`, se as strings vierem no array padrão
+  `permissions` do access token.
 
-1. Copie `.env.example` para `.env`, defina `DB_PASSWORD` e substitua os valores de exemplo pelas configurações do Auth0. O Spring não carrega `.env` automaticamente; exporte as variáveis no terminal ou configure-as na IDE. No PowerShell, por exemplo:
+Para permissions, configure permissões na API do Auth0, habilite RBAC e
+**Add Permissions in the Access Token**, e conceda as permissões à aplicação/
+usuário conforme a política do tenant. A API continuará sendo a autoridade final:
+esconder um botão no frontend não protege endpoint algum.
 
-   ```powershell
-   $env:DB_PASSWORD = "senha-local"
-   $env:AUTH0_ISSUER_URI = "https://seu-tenant.us.auth0.com/"
-   $env:AUTH0_AUDIENCE = "identifier-da-api"
-   $env:AUTH0_ROLES_CLAIM = "https://simulado-backend.example.com/roles"
-   $env:AUTH0_EMAIL_CLAIM = "https://simulado-backend.example.com/email"
-   ```
+Não é obrigatório usar roles e permissions ao mesmo tempo. Escolha um modelo,
+documente-o e mantenha Action, frontend e backend consistentes.
 
-2. Inicie o PostgreSQL: `docker compose up -d`.
-3. Exporte as variáveis do `.env` no terminal e rode `mvn spring-boot:run`; alternativamente, configure-as na sua IDE. O Flyway cria a tabela automaticamente.
-4. Execute os testes e gere o JAR com `mvn verify`.
+## 4. Adaptar para uma aplicação diferente
 
-Variáveis principais: `DATABASE_URL` (opcional; padrão `jdbc:postgresql://localhost:5432/avaliacoes`), `DB_USERNAME`, `DB_PASSWORD`, `AUTH0_ISSUER_URI`, `AUTH0_AUDIENCE`, `AUTH0_ROLES_CLAIM`, `AUTH0_EMAIL_CLAIM`, `CORS_ALLOWED_ORIGINS` e `PORT`.
+Use esta sequência como checklist. Evite reaproveitar nomes de roles ou claims
+sem confirmar que ainda representam as regras do novo domínio.
 
-## Deploy na AWS EC2 com GitHub Actions
+### 4.1 Escolha a estratégia de identidade
 
-O workflow `.github/workflows/deploy.yml` executa `mvn verify` em pushes para `main` e em disparos manuais. Em seguida, copia o JAR por SSH e reinicia um serviço `systemd`. Ele não precisa de chaves de acesso AWS: usa uma chave SSH dedicada ao deploy.
+- Para isolar aplicações ou ambientes, crie um novo **API Identifier** e use-o
+  como audience. Isso ajuda a evitar que um token emitido para uma API seja aceito
+  por outra.
+- Decida se o usuário será identificado por `sub` (identificador estável do
+  Auth0) ou por e-mail. E-mail pode mudar e pode não estar verificado; para
+  relações duradouras, normalmente é melhor persistir `sub` e tratar e-mail como
+  dado de perfil.
+- Defina uma convenção de namespace URI para claims customizadas que você
+  controla, por exemplo `https://sua-organizacao.example/claims/roles`. Evite
+  nomes curtos e nomes pertencentes a protocolos reservados.
+- Decida se autorização será por roles amplas (RBAC), permissions granulares ou
+  uma combinação deliberada. Não faça o código aceitar qualquer texto vindo de
+  um claim como autoridade sem validação.
 
-### Preparar a EC2
+### 4.2 Atualize o Auth0
 
-Os comandos abaixo assumem Ubuntu 24.04. Restrinja a porta 22 no Security Group ao seu IP e aos IPs de saída do runner que você configurar. Para produção, use HTTPS por meio de um domínio e proxy reverso/Load Balancer. A aplicação deve ficar vinculada a `127.0.0.1` e ser publicada pelo proxy HTTPS; não exponha diretamente a porta 8080.
+- Crie/configure o resource server (API) com o novo Identifier.
+- Configure a política de acesso delegado e autorize apenas os clientes
+  necessários.
+- Crie as roles e/ou permissions do novo domínio e atribua-as aos usuários.
+- Atualize a Post Login Action para emitir os claims que o backend realmente
+  espera. Para roles, `event.authorization?.roles` contém roles atribuídas ao
+  usuário; para permissions, configure a API para incluir `permissions`.
+- Faça deploy da Action e confira sua posição no flow.
+- Configure URLs permitidas para cada ambiente da SPA.
+- Teste access tokens da API, não apenas ID tokens. Confira `iss`, `aud`,
+  permissions e claims customizadas.
+- Mantenha configuração separada entre desenvolvimento e produção quando os
+  tenants, APIs, usuários ou políticas diferirem.
 
-Conecte-se à instância e instale Java e PostgreSQL:
+### 4.3 Atualize este backend
 
-```bash
-sudo apt update
-sudo apt install -y openjdk-21-jre-headless postgresql
-sudo systemctl enable --now postgresql
-sudo useradd --system --home /opt/avaliacoes-api --shell /usr/sbin/nologin avaliacoes
-sudo install -d -o avaliacoes -g avaliacoes -m 0750 /opt/avaliacoes-api
-```
+1. `src/main/resources/application.yml`: verifique a variável de issuer, audience,
+   claim de roles, claim de e-mail e origens CORS.
+2. `src/main/java/br/com/simulado/avaliacoes/config/Auth0RolesConverter.java`:
+   ajuste quais roles/permissions são reconhecidas e como elas se mapeiam às
+   authorities Spring.
+3. `SecurityConfig.java`: troque as regras `requestMatchers` de cada método/rota.
+   Prefira negar por padrão e autorizar explicitamente.
+4. Controller/serviço: troque a forma de extrair identidade. Atualmente `POST`
+   precisa da claim de e-mail configurada; uma nova aplicação pode precisar de
+   `sub`, organization ID ou outra claim.
+5. Testes: atualize testes do converter, do validator de audience e das regras
+   de endpoint para incluir casos autorizados e negados.
+6. `.env.example` e configuração no servidor: atualize nomes/valores para o novo
+   ambiente, sem adicionar segredos ao Git.
+7. Se as entidades mudarem, crie novas migrações Flyway; não altere migrações já
+   aplicadas em banco compartilhado.
 
-Crie um banco e usuário PostgreSQL isolados para a API:
+`AUTH0_ROLES_CLAIM` e `AUTH0_EMAIL_CLAIM` são configuráveis por variável de
+ambiente. A lista de roles reconhecidas e o mapeamento de permissions, por outro
+lado, são código no `Auth0RolesConverter`; mudar só a variável não cria uma nova
+role suportada.
 
-```bash
-sudo -u postgres psql
-```
+## 5. Executar localmente
 
-No prompt do PostgreSQL:
+### Requisitos
 
-```sql
-CREATE ROLE avaliacoes LOGIN;
-\password avaliacoes
-CREATE DATABASE avaliacoes OWNER avaliacoes;
-\q
-```
+- JDK 21.
+- Maven 3.9+ (ou Maven Wrapper, se adicionado ao projeto).
+- Docker Desktop / Docker Compose para PostgreSQL local.
+- Tenant e API Auth0 de desenvolvimento para testar endpoints autenticados.
 
-Defina uma senha forte quando `\password` solicitar e guarde-a apenas no servidor. Crie `/etc/avaliacoes-api.env` com os valores do banco e do Auth0 (não os coloque no repositório):
+### Banco local
 
-```ini
-PORT=8080
-DATABASE_URL=jdbc:postgresql://HOST_DO_POSTGRES:5432/avaliacoes
-DB_USERNAME=USUARIO_DO_BANCO
-DB_PASSWORD=SENHA_DO_BANCO
-AUTH0_ISSUER_URI=https://SEU_TENANT_AUTH0/
-AUTH0_AUDIENCE=IDENTIFIER_DA_API
-AUTH0_ROLES_CLAIM=https://simulado-backend.example.com/roles
-AUTH0_EMAIL_CLAIM=https://simulado-backend.example.com/email
-CORS_ALLOWED_ORIGINS=https://SEU_FRONT.vercel.app
-```
-
-Na configuração deste servidor, o PostgreSQL roda localmente e escuta apenas em `127.0.0.1`. Se optar por RDS, permita conexões à porta 5432 somente a partir do Security Group da EC2. Proteja o arquivo de ambiente:
-
-```bash
-sudo chown root:root /etc/avaliacoes-api.env
-sudo chmod 600 /etc/avaliacoes-api.env
-```
-
-Crie `/etc/systemd/system/avaliacoes-api.service`:
-
-```ini
-[Unit]
-Description=API de avaliações
-After=network.target postgresql.service
-Requires=postgresql.service
-
-[Service]
-User=avaliacoes
-Group=avaliacoes
-WorkingDirectory=/opt/avaliacoes-api
-EnvironmentFile=/etc/avaliacoes-api.env
-ExecStart=/usr/bin/java -Dserver.address=127.0.0.1 -Xms64m -Xmx384m -XX:MaxMetaspaceSize=128m -jar /opt/avaliacoes-api/app.jar
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Crie `/usr/local/sbin/deploy-avaliacoes-api` para instalar o artefato e reiniciar o serviço:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-test -s /tmp/avaliacoes-api.jar
-install -o avaliacoes -g avaliacoes -m 0644 /tmp/avaliacoes-api.jar /opt/avaliacoes-api/app.jar
-rm -f /tmp/avaliacoes-api.jar
-systemctl restart avaliacoes-api
-for attempt in $(seq 1 30); do
-  status=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/avaliacoes || true)
-  if [[ "$status" == "401" ]]; then
-    exit 0
-  fi
-  sleep 2
-done
-systemctl --no-pager --full status avaliacoes-api
-exit 1
-```
-
-Configure o serviço e um usuário de deploy dedicado. Gere um par de chaves SSH próprio para o GitHub Actions no seu computador; não reutilize a chave administrativa `.pem` da EC2:
-
-```bash
-sudo chmod 750 /usr/local/sbin/deploy-avaliacoes-api
-sudo systemctl daemon-reload
-sudo systemctl enable avaliacoes-api
-sudo useradd --create-home --shell /bin/bash deploy
-sudo install -d -o deploy -g deploy -m 0700 /home/deploy/.ssh
-```
-
-No Windows, gere a chave com `ssh-keygen -t ed25519 -C github-actions-deploy -f "$env:USERPROFILE\Downloads\simulado-backend-deploy"` e deixe a passphrase vazia para uso não interativo. Instale o conteúdo do arquivo `.pub` em `/home/deploy/.ssh/authorized_keys`, proteja-o com `sudo chown deploy:deploy /home/deploy/.ssh/authorized_keys` e `sudo chmod 600 /home/deploy/.ssh/authorized_keys`. Autorize somente o script de deploy:
-
-```bash
-echo 'deploy ALL=(root) NOPASSWD: /usr/local/sbin/deploy-avaliacoes-api' | sudo tee /etc/sudoers.d/avaliacoes-deploy
-sudo chmod 440 /etc/sudoers.d/avaliacoes-deploy
-sudo visudo -cf /etc/sudoers.d/avaliacoes-deploy
-```
-
-### Configurar GitHub Actions
-
-No GitHub, abra o repositório e vá a **Settings > Secrets and variables > Actions > New repository secret**. Cadastre:
-
-| Secret | Valor / onde obter |
-|---|---|
-| `EC2_HOST` | IP público ou DNS da EC2; use um Elastic IP para não mudar após reinicializações. |
-| `EC2_USER` | `deploy`, usuário SSH criado acima. |
-| `EC2_SSH_PRIVATE_KEY` | Conteúdo completo da chave privada dedicada ao GitHub Actions correspondente à chave pública em `authorized_keys`. Cole somente no secret, nunca no repositório ou no chat. |
-| `EC2_KNOWN_HOSTS` | Linha de chave pública do host para `EC2_HOST`, obtida de uma conexão SSH previamente verificada. Não desative `StrictHostKeyChecking`. |
-
-No PowerShell, a chave de host já conhecida pode ser consultada com:
+Na raiz do repositório:
 
 ```powershell
-ssh-keygen -F 3.221.155.116 -f "$env:USERPROFILE\.ssh\known_hosts" | Select-String "ssh-ed25519"
+Copy-Item .env.example .env
 ```
 
-Copie a linha `ssh-ed25519` para `EC2_KNOWN_HOSTS`. Os valores de PostgreSQL/Auth0 são configurados no arquivo de ambiente da EC2, não nos secrets usados para o deploy. Depois de salvar os secrets, faça push para `main` ou execute **Actions > Build and deploy backend > Run workflow**. Consulte o log da execução em **Actions** e, se necessário, na EC2 use `sudo journalctl -u avaliacoes-api -f`.
+Edite `.env` e defina ao menos `DB_PASSWORD`. O Spring Boot **não carrega um
+arquivo `.env` automaticamente**. Exporte as variáveis no processo, use uma
+ferramenta local de dotenv ou configure o ambiente de execução da IDE. Exemplo
+no PowerShell:
 
-O serviço deste projeto escuta somente em `127.0.0.1:8080`. Antes de chamar a API pelo front-end, configure um domínio e o proxy HTTPS para encaminhar `/avaliacoes` à aplicação; ajuste `CORS_ALLOWED_ORIGINS` no arquivo de ambiente da EC2 para a origem do front-end.
+```powershell
+$env:DB_PASSWORD = "senha-local"
+$env:AUTH0_ISSUER_URI = "https://seu-tenant.us.auth0.com/"
+$env:AUTH0_AUDIENCE = "identifier-da-api"
+$env:AUTH0_ROLES_CLAIM = "https://sua-organizacao.example/claims/roles"
+$env:AUTH0_EMAIL_CLAIM = "https://sua-organizacao.example/claims/email"
+$env:CORS_ALLOWED_ORIGINS = "http://localhost:5173"
+```
+
+Inicie o PostgreSQL:
+
+```powershell
+docker compose up -d
+```
+
+Depois rode a API:
+
+```powershell
+mvn spring-boot:run
+```
+
+O Flyway executa as migrações ao iniciar. Para verificar/buildar:
+
+```powershell
+mvn verify
+```
+
+O PostgreSQL local publicado pelo Compose usa a porta 5432 e volume persistente
+`postgres-data`. Não remova esse volume se quiser manter os dados de
+desenvolvimento.
+
+### Variáveis do backend
+
+| Variável | Obrigatória? | Uso |
+|---|---:|---|
+| `PORT` | Não | Porta do Spring; padrão `8080`. |
+| `DATABASE_URL` | Não | JDBC URL; padrão `jdbc:postgresql://localhost:5432/avaliacoes`. |
+| `DB_USERNAME` | Não | Usuário do banco; padrão do ambiente local `avaliacoes`. |
+| `DB_PASSWORD` | Sim | Senha do banco; fornecida fora do repositório. |
+| `AUTH0_ISSUER_URI` | Sim | Issuer do tenant Auth0, normalmente com barra final. |
+| `AUTH0_AUDIENCE` | Sim | Identifier exato da API Auth0 que o token precisa conter. |
+| `AUTH0_ROLES_CLAIM` | Não | Claim de roles; padrão `https://simulado-backend.example.com/roles`. |
+| `AUTH0_EMAIL_CLAIM` | Não | Claim usada para identificar e-mail do avaliador; padrão `https://simulado-backend.example.com/email`. |
+| `CORS_ALLOWED_ORIGINS` | Não | Lista separada por vírgula de origens; padrão local inclui portas 3000 e 5173. |
+
+Não coloque senha do banco, chave SSH, client secret ou token de usuário em
+`.env.example`, no frontend, no GitHub ou em logs. A SPA não precisa de client
+secret.
+
+## 6. Deploy atual na AWS EC2
+
+### Como o GitHub Actions faz deploy
+
+`.github/workflows/deploy.yml`:
+
+1. Roda em push para `main` ou `workflow_dispatch`.
+2. Configura Java 21.
+3. Executa `mvn --batch-mode verify`.
+4. Configura SSH usando secrets do repositório.
+5. Copia `target/avaliacoes-api.jar` para `/tmp/avaliacoes-api.jar`.
+6. Executa `/usr/local/sbin/deploy-avaliacoes-api` por SSH com `sudo`.
+
+Esse fluxo **não exige AWS access key** nem permissão de gerenciamento do
+Security Group. Ele exige rede SSH até a EC2 e credenciais SSH adequadas. O
+script de deploy substitui o JAR e reinicia `avaliacoes-api`; configurações do
+systemd em drop-ins permanecem no host entre deploys.
+
+Secrets esperados em **GitHub > Repository > Settings > Secrets and variables >
+Actions**:
+
+| Secret | Valor |
+|---|---|
+| `EC2_HOST` | IP público ou DNS estável da EC2; Elastic IP evita mudança de IP. |
+| `EC2_USER` | Usuário SSH com permissão restrita para executar o deploy. |
+| `EC2_SSH_PRIVATE_KEY` | Chave privada dedicada ao workflow. Nunca publicar ou reutilizar a chave administrativa. |
+| `EC2_KNOWN_HOSTS` | Chave pública de host verificada para a instância. Não desabilitar `StrictHostKeyChecking`. |
+
+O arquivo `/etc/avaliacoes-api.env` da EC2 contém configuração do banco e do
+Auth0; o workflow não o cria nem sincroniza. Proteja-o no servidor com
+`root:root` e modo `600`.
+
+### Estado atual conhecido da EC2
+
+- Host/IP usado pela configuração atual da Vercel: `3.221.155.116`.
+- Serviço systemd: `avaliacoes-api`.
+- JAR: `/opt/avaliacoes-api/app.jar`.
+- Porta da API: TCP `8080`.
+- PostgreSQL local: porta `5432`, não deve ser pública.
+- A aplicação responde `401` sem token em `/avaliacoes`, comportamento normal
+  que também é usado como verificação simples de saúde pelo script de deploy.
+- A aplicação está atualmente configurada por um drop-in
+  `/etc/systemd/system/avaliacoes-api.service.d/override.conf` para bind
+  `0.0.0.0` durante o exercício.
+- `CORS_ALLOWED_ORIGINS` inclui
+  `https://simulado-frontend-seven.vercel.app`.
+- A porta 8080 está temporariamente acessível publicamente para a rewrite.
+
+O Security Group é uma configuração da AWS fora do repositório. O acesso SSH à
+máquina não dá, por si só, permissão para alterar o Security Group.
+
+### Exposição temporária da EC2 e como reverter
+
+O bind `0.0.0.0:8080` torna a aplicação acessível em todas as interfaces de rede.
+Com a entrada TCP 8080 permitida no Security Group, qualquer IP pode tentar
+conectar-se à API. A autenticação JWT continua exigida para GET/POST, mas isso
+não cifra o tráfego e não elimina riscos de exposição.
+
+Quando terminar a demonstração:
+
+1. No Console AWS, remova a regra de entrada TCP 8080 para `0.0.0.0/0` (ou remova
+   a regra TCP 8080 temporária). Este passo requer alguém com permissão AWS.
+2. Na EC2, remova o drop-in público e volte ao unit file original que usa
+   `-Dserver.address=127.0.0.1`:
+
+   ```bash
+   sudo rm /etc/systemd/system/avaliacoes-api.service.d/override.conf
+   sudo systemctl daemon-reload
+   sudo systemctl restart avaliacoes-api
+   sudo systemctl is-active avaliacoes-api
+   sudo ss -ltnp | grep 8080
+   ```
+
+3. Confirme que o listener voltou a `127.0.0.1:8080`.
+4. Revise as regras da Vercel e remova o rewrite para HTTP se ele não for mais
+   necessário. O frontend deixará de chamar a API até existir outro endpoint.
+5. Verifique se o endereço público, logs ou tokens foram compartilhados durante
+   o teste; revogue/rotacione credenciais se necessário.
+
+Para uma publicação duradoura, use domínio com TLS em proxy reverso ou load
+balancer, mantenha a aplicação em localhost, restrinja as regras de rede e evite
+encaminhar access tokens por HTTP.
+
+## 7. Configuração Vercel/API e CORS
+
+O frontend deste exercício usa uma rewrite same-origin:
+
+```text
+Browser --HTTPS--> simulado-frontend-seven.vercel.app/api/avaliacoes
+Vercel  --HTTP----> 3.221.155.116:8080/avaliacoes
+```
+
+Isso mantém HTTPS apenas entre o navegador e a Vercel; o segundo trecho é HTTP.
+O browser vê chamadas same-origin, então CORS não costuma ser necessário nessa
+rota específica. O backend, no entanto, mantém CORS configurável para uso direto,
+local e outras origens.
+
+CORS **não é autenticação** e não bloqueia clientes que não sejam navegadores.
+`CORS_ALLOWED_ORIGINS` deve conter a origem, sem caminho nem barra extra,
+separada por vírgulas. Se o frontend chamar a API diretamente, o browser pode
+fazer preflight por causa de `Authorization` e `Content-Type`; o backend permite
+`GET`, `POST`, `OPTIONS` e esses cabeçalhos.
+
+## 8. Testes e diagnóstico
+
+```powershell
+mvn test
+mvn verify
+```
+
+Checklist de falhas comuns:
+
+| Sintoma | O que conferir |
+|---|---|
+| `401 Unauthorized` | Header Bearer enviado? Token expirado? `AUTH0_ISSUER_URI` e `AUTH0_AUDIENCE` correspondem exatamente às claims `iss` e `aud`? |
+| `403 Forbidden` em GET | Role `USER`/`ADMIN` ou permission `avaliacoes:read` está no **access token**? Claim name coincide com `AUTH0_ROLES_CLAIM`? |
+| `403 Forbidden` em POST | Usuário tem `ADMIN` ou `avaliacoes:write`? A Action emite roles? O JWT contém claim de e-mail em `AUTH0_EMAIL_CLAIM`? |
+| Erro de issuer | Use o issuer completo do tenant, normalmente incluindo `/` final. Não use Client ID como issuer. |
+| Erro de audience | Use o API Identifier, não domínio, Client ID ou Management API audience. |
+| Action não altera token | Action está implantada e conectada ao Login Flow? O pedido é por access token para a API? |
+| `Failed to connect`/502 | Serviço ativo? Listener na interface adequada? Porta liberada no Security Group? O destino na rewrite está correto? |
+| CORS no navegador | Origem do frontend exatamente igual à configurada? A chamada usa origem direta ou rewrite same-origin? Preflight está chegando? |
+| Erro de banco | PostgreSQL ativo? JDBC URL, usuário e senha corretos? Porta 5432 não está sendo confundida com API? Flyway/migrações concluídas? |
+
+No servidor:
+
+```bash
+sudo systemctl status avaliacoes-api --no-pager
+sudo journalctl -u avaliacoes-api -n 100 --no-pager
+sudo ss -ltnp
+curl -i http://127.0.0.1:8080/avaliacoes
+```
+
+Um `401` no último comando confirma que o processo respondeu e a rota está
+protegida; não confirma que um usuário autenticado conseguirá ler dados.
+
+## 9. Cuidados antes de reaproveitar
+
+- Troque audience, claims e regras de autorização para cada API/domínio.
+- Não use a Management API do Auth0 como audience de uma API de negócio.
+- Não confie no frontend para impor permissões.
+- Não guarde credenciais ou tokens no código, bundle Vite, issues ou logs.
+- Use identificador estável do usuário (`sub`) se o domínio depender de identidade
+  duradoura; e-mail é um atributo que pode mudar.
+- Defina políticas de acesso por endpoint, não apenas roles genéricas.
+- Revise CORS, TLS, Security Groups, banco, backups e retenção.
+- Separe dados e credenciais de desenvolvimento e produção.
+- Adicione migrations e testes ao alterar o modelo.
+- Depois da demonstração, remova a exposição pública temporária da porta 8080.

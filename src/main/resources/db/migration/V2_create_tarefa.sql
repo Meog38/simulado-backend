@@ -1,0 +1,8 @@
+CREATE TABLE tarefa (
+    id BIGSERIAL PRIMARY KEY,
+    titulo VARCHAR(255) NOT NULL,
+    descricao TEXT,
+    prioridade VARCHAR(50) NOT NULL,
+    email_usuario VARCHAR(320) NOT NULL,
+    data_criacao TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
